@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -252,11 +253,23 @@ func (cli *Client) pushImageToMachine(
 	proxyCtrID := ""
 	pushImageTag := ""
 
+	// Determine if Podman CLI is installed.
+	podmanCLIInstalled := isPodmanCLIInstalled()
+
 	// Cleanup function to remove temporary resources and stop proxies.
 	cleanup := func() {
 		// Remove temporary image tag.
 		if pushImageTag != "" {
-			dockerCli.ImageRemove(ctx, pushImageTag, image.RemoveOptions{})
+			// If Podman CLI is installed, remove the tag using Podman. Otherwise, use Docker client.
+			if podmanCLIInstalled {
+				cmd := exec.CommandContext(ctx, "podman", "rmi", pushImageTag)
+				if output, cmdErr := cmd.CombinedOutput(); cmdErr != nil {
+					// Log the error but don't fail the entire cleanup.
+					fmt.Printf("Warning: podman rmi failed for %s: %v\nOutput: %s\n", pushImageTag, cmdErr, output)
+				}
+			} else {
+				dockerCli.ImageRemove(ctx, pushImageTag, image.RemoveOptions{})
+			}
 		}
 
 		// Remove socat proxy container.
@@ -300,11 +313,45 @@ func (cli *Client) pushImageToMachine(
 
 	// Tag the image for pushing through the proxy.
 	pushImageTag = fmt.Sprintf("127.0.0.1:%d/%s", proxyPort, imageName)
-	if err = dockerCli.ImageTag(ctx, imageName, pushImageTag); err != nil {
-		return fmt.Errorf("tag image for push: %w", err)
+
+	// If Podman CLI is installed, tag the image using the Podman client.
+	if podmanCLIInstalled {
+		tagArgs := []string{"tag", imageName, pushImageTag}
+		tagCmd := exec.CommandContext(ctx, "podman", tagArgs...)
+		if output, cmdErr := tagCmd.CombinedOutput(); cmdErr != nil {
+			return fmt.Errorf("podman tag failed: %w\nOutput: %s", cmdErr, output)
+		}
+	} else {
+		if err = dockerCli.ImageTag(ctx, imageName, pushImageTag); err != nil {
+			return fmt.Errorf("tag image for push: %w", err)
+		}
 	}
 
-	// Push the image through the proxy.
+	// If Podman CLI is installed, push the image using the Podman client.
+	if podmanCLIInstalled {
+		pw.Event(progress.NewEvent(pushEventID, progress.Working, "Pushing with Podman"))
+
+		// Construct the Podman push command.
+		// We'll assume Podman is in the PATH.
+		args := []string{"push", "--tls-verify=false"}
+		if platform != nil {
+			// Podman uses --platform for multi-platform images.
+			args = append(args, "--platform", fmt.Sprintf("%s/%s", platform.OS, platform.Architecture))
+		}
+		args = append(args, pushImageTag)
+
+		cmd := exec.CommandContext(ctx, "podman", args...)
+		output, cmdErr := cmd.CombinedOutput()
+		if cmdErr != nil {
+			pw.Event(progress.NewEvent(pushEventID, progress.Error, cmdErr.Error()))
+			return fmt.Errorf("podman push failed: %w\nOutput: %s", cmdErr, output)
+		}
+
+		pw.Event(progress.NewEvent(pushEventID, progress.Done, "Pushed with Podman"))
+		return nil // Podman push handled, return early.
+	}
+
+	// Push the image through the proxy (for non-Podman clients).
 	pw.Event(progress.NewEvent(pushEventID, progress.Working, "Pushing"))
 
 	pushCh, err := dockerCli.PushImage(ctx, pushImageTag, image.PushOptions{
@@ -361,6 +408,12 @@ func newUnregistryProxy(
 	}
 
 	return p, nil
+}
+
+// isPodmanCLIInstalled checks if the 'podman' executable is available in the system's PATH.
+func isPodmanCLIInstalled() bool {
+	_, err := exec.LookPath("podman")
+	return err == nil
 }
 
 // isDockerVirtualised checks if Docker is running in a virtualised environment like Docker Desktop on macOS.
